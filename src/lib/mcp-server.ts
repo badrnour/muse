@@ -9,14 +9,29 @@ import { listRecentTasks, getTask } from "./turso";
 import { formatTaskReply, refreshTask, runGeneration } from "./generation";
 import { runMerge, validateMergeUrls } from "./merger";
 import { IMAGE_MODEL_CANONICAL, VIDEO_MODEL_CANONICAL } from "./models";
+import {
+  METRICOOL_NOT_CONFIGURED_MESSAGE,
+  PUBLISH_NETWORKS,
+  metricoolConfigured,
+  publishVideoJob,
+  type PublishNetwork,
+} from "./metricool";
+import {
+  DEFAULT_HASHTAGS,
+  buildCaption,
+  pickStoryIdea,
+  type StoryIdea,
+} from "./story-ideas";
 
-export const SERVER_INFO = { name: "media-generator-mcp", version: "1.2.0" } as const;
+export const SERVER_INFO = { name: "media-generator-mcp", version: "1.3.0" } as const;
 
-export const SERVER_INSTRUCTIONS = `AI media generation server (kie.ai + CometAPI with automatic sequential multi-key failover, plus video merging).
+export const SERVER_INSTRUCTIONS = `AI media generation server (kie.ai + CometAPI with automatic sequential multi-key failover, plus video merging and Metricool auto-publishing).
 Workflow: call generate_image or generate_video. If the response contains finished URLs, show them to the user.
 If it returns a task_id with status PROCESSING, call get_task with that task_id every ~10 seconds until status is completed (show the URL) or failed (explain why).
 IMPORTANT: the server automatically switches API keys in strict order on any failure (exhausted balance, invalid key, rate limits) and continues the SAME task under the same task_id — you will never encounter key/balance errors. Never stop or warn the user about keys or balances; just keep polling get_task until the result appears.
 To concatenate several finished clips into one video, call merge_videos with 'urls' (direct links) or 'task_ids' (completed video tasks, in merge order); track it with get_task the same way. Note: the merged file is stored on the merging service for ~24 hours only — tell the user to watch/download it promptly.
+To publish a finished video, call publish_video with the video URL or a completed task_id, an English caption, and the target network (facebook by default). Without scheduled_at it publishes as soon as possible (now + 5 minutes); with scheduled_at it is scheduled for that time. If Metricool is not configured, publish_video returns a clear error — never claim a video was published when it was not.
+To make a full Fayyaz-page reel in one call, use create_story_video: it picks a story idea (or uses the one you pass), generates the video, and writes the English caption + hashtags. It does NOT publish unless publish=true is passed explicitly — never publish without being asked.
 Use list_media to recall previously generated media from the database.`;
 
 const IMAGE_ASPECT_RATIOS = [
@@ -238,6 +253,208 @@ export function createMcpServer(): McpServer {
         );
       });
       return textResult(`Latest media (${tasks.length}):\n\n${lines.join("\n\n")}`);
+    }
+  );
+
+  server.registerTool(
+    "publish_video",
+    {
+      description:
+        "Publish/schedule a finished video through Metricool (Facebook by default). Pass 'video_url' (a public direct video link) or 'task_id' of a COMPLETED video/merge task, plus an English caption. Without scheduled_at it publishes as soon as possible (now + 5 minutes); with scheduled_at (ISO date-time) it is scheduled for that time. Returns the Metricool post id and the scheduled time. If Metricool is not configured, returns a clear error — never claim a video was published when it was not.",
+      inputSchema: {
+        video_url: z
+          .string()
+          .optional()
+          .describe("Public direct video URL to publish."),
+        task_id: z
+          .string()
+          .optional()
+          .describe("Alternative to video_url: task_id of a COMPLETED video or merge task — its result URL is published."),
+        caption: z
+          .string()
+          .default("New video! Follow for more.")
+          .describe("English caption for the post (hashtags included if you add them)."),
+        networks: z
+          .array(z.enum(PUBLISH_NETWORKS))
+          .default(["facebook"])
+          .describe("Target networks — facebook by default. Each must be connected in Metricool."),
+        scheduled_at: z
+          .string()
+          .optional()
+          .describe("ISO date-time to schedule for (must be in the future). Omit to publish as soon as possible."),
+        timezone: z
+          .string()
+          .default("Africa/Cairo")
+          .describe("IANA timezone for scheduled_at (e.g. Africa/Cairo)."),
+        draft: z
+          .boolean()
+          .default(false)
+          .describe("Save as a draft in Metricool instead of scheduling it."),
+      },
+    },
+    async (args) => {
+      // Resolve the video URL: task_id first, then the direct URL.
+      let videoUrl = args.video_url ?? "";
+      let sourceTaskId: string | null = null;
+      if (args.task_id) {
+        const task = await getTask(args.task_id);
+        const firstUrl = task?.resultUrls?.[0];
+        if (task && task.status === "completed" && firstUrl) {
+          videoUrl = firstUrl;
+          sourceTaskId = task.id;
+        } else {
+          return textResult(
+            `❌ Cannot publish task ${args.task_id}: ${task ? `status is ${task.status}` : "task not found"}. Publish only completed video or merge tasks.`,
+            true
+          );
+        }
+      }
+      if (!videoUrl || !/^https?:\/\//i.test(videoUrl)) {
+        return textResult(
+          "❌ publish_video needs a video_url (public http/https link) or a task_id of a completed video/merge task.",
+          true
+        );
+      }
+      if (!metricoolConfigured()) {
+        // Record the failed attempt so the dashboard shows it, then report it.
+        await publishVideoJob({
+          taskId: sourceTaskId,
+          videoUrl,
+          caption: args.caption,
+          networks: args.networks as PublishNetwork[],
+          scheduledAt: args.scheduled_at,
+          timezone: args.timezone,
+          draft: args.draft,
+        });
+        return textResult(METRICOOL_NOT_CONFIGURED_MESSAGE, true);
+      }
+      const result = await publishVideoJob({
+        taskId: sourceTaskId,
+        videoUrl,
+        caption: args.caption,
+        networks: args.networks as PublishNetwork[],
+        scheduledAt: args.scheduled_at,
+        timezone: args.timezone,
+        draft: args.draft,
+      });
+      if (!result.ok) {
+        return textResult(`❌ Publishing failed: ${result.error}`, true);
+      }
+      const when = new Date(result.scheduledAt).toLocaleString("en-GB", {
+        timeZone: args.timezone,
+      });
+      return textResult(
+        result.draft
+          ? `✅ Video saved as a draft in Metricool\n\nMetricool post id: ${result.postId}\nNetworks: ${args.networks.join(", ")}\nVideo: ${videoUrl}`
+          : `✅ Video scheduled on Metricool\n\nMetricool post id: ${result.postId}\nNetworks: ${args.networks.join(", ")}\nScheduled for: ${when} (${args.timezone})\nVideo: ${videoUrl}\nCaption: ${args.caption}`
+      );
+    }
+  );
+
+  server.registerTool(
+    "create_story_video",
+    {
+      description:
+        "Make a full Fayyaz-page reel in one call: pick a story idea automatically from the idea bank (or use the 'idea' text you pass), generate the video with grok-imagine-video-1-5-preview, and write the English caption + hashtags. Returns the video task_id (poll with get_task) and the caption. It does NOT publish unless publish=true is passed explicitly — never publish without being asked.",
+      inputSchema: {
+        idea: z
+          .string()
+          .optional()
+          .describe("Optional custom story idea (plain English text). Omit to pick today's idea from the bank automatically."),
+        caption: z
+          .string()
+          .optional()
+          .describe("Optional caption override (English). Omit to use the idea's caption + hashtags."),
+        publish: z
+          .boolean()
+          .default(false)
+          .describe("Publish through Metricool as soon as the video completes (only when the video finished inside the wait window). Default: do NOT publish."),
+        networks: z
+          .array(z.enum(PUBLISH_NETWORKS))
+          .default(["facebook"])
+          .describe("Networks to publish to when publish=true."),
+        scheduled_at: z
+          .string()
+          .optional()
+          .describe("ISO date-time to schedule for when publish=true. Omit to publish as soon as possible."),
+        timezone: z.string().default("Africa/Cairo"),
+        duration: z.number().int().min(1).max(15).default(8).describe("Duration in seconds."),
+        aspect_ratio: z.enum(VIDEO_ASPECT_RATIOS).default("9:16").describe("Vertical 9:16 by default for reels."),
+        resolution: z.enum(["480p", "720p", "1080p"]).default("480p"),
+        wait_seconds: z.number().int().min(0).max(240).default(25),
+      },
+    },
+    async (args, extra) => {
+      // Resolve the idea: custom text, or today's pick from the bank.
+      let idea: StoryIdea;
+      if (args.idea && args.idea.trim() !== "") {
+        idea = {
+          id: "custom",
+          title: args.idea.trim().slice(0, 80),
+          prompt: args.idea.trim(),
+          caption: "Watch this! 😄",
+          hashtags: DEFAULT_HASHTAGS,
+        };
+      } else {
+        idea = pickStoryIdea();
+      }
+      const caption = args.caption?.trim() ? args.caption.trim() : buildCaption(idea);
+
+      const result = await runGeneration(
+        {
+          type: "video",
+          model: VIDEO_MODEL_CANONICAL,
+          prompt: idea.prompt,
+          aspectRatio: args.aspect_ratio,
+          resolution: args.resolution,
+          enableAudio: true,
+          duration: args.duration,
+          waitSeconds: args.wait_seconds,
+        },
+        makeNotifier(extra)
+      );
+      if (result.outcome === "failed" || result.outcome === "no_keys" || !result.task) {
+        return textResult(result.message, true);
+      }
+      const task = result.task;
+      const videoUrl = task.resultUrls?.[0];
+
+      // Publish only when explicitly asked AND the video already finished.
+      if (args.publish && result.outcome === "completed" && videoUrl) {
+        const published = await publishVideoJob({
+          taskId: task.id,
+          videoUrl,
+          caption,
+          networks: args.networks as PublishNetwork[],
+          scheduledAt: args.scheduled_at,
+          timezone: args.timezone,
+        });
+        if (!published.ok) {
+          return textResult(
+            `${formatTaskReply(task)}\n\nCaption:\n${caption}\n\n❌ Publishing failed: ${published.error}`,
+            true
+          );
+        }
+        const when = new Date(published.scheduledAt).toLocaleString("en-GB", {
+          timeZone: args.timezone,
+        });
+        return textResult(
+          `${formatTaskReply(task)}\n\nCaption:\n${caption}\n\n✅ Video scheduled on Metricool\nMetricool post id: ${published.postId}\nNetworks: ${args.networks.join(", ")}\nScheduled for: ${when} (${args.timezone})`
+        );
+      }
+      if (args.publish && result.outcome === "processing") {
+        return textResult(
+          `${formatTaskReply(task)}\n\nCaption (ready to post):\n${caption}\n\n` +
+            `The video is still generating, so nothing was published yet. ` +
+            `Once get_task shows completed, call publish_video with task_id ${task.id} to publish it.`
+        );
+      }
+      return textResult(
+        `${formatTaskReply(task)}\n\nStory: ${idea.title}\nCaption:\n${caption}` +
+          (args.publish
+            ? ""
+            : "\n\nNot published (publish=false) — call publish_video with the task_id when you want it live.")
+      );
     }
   );
 

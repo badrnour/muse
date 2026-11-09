@@ -58,6 +58,22 @@ export interface ApiKeyRow {
   created_at: string;
 }
 
+export type PublishStatus = "draft" | "scheduled" | "published" | "failed";
+
+export interface PublishJobRow {
+  id: string;
+  task_id: string | null;
+  video_url: string;
+  network: string;
+  caption: string;
+  scheduled_at: string | null;
+  metricool_post_id: string | null;
+  status: PublishStatus;
+  error_message: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 let client: Client | null = null;
 
 function getClient(): Client {
@@ -107,11 +123,31 @@ const CREATE_KEYS_SQL = `CREATE TABLE IF NOT EXISTS api_keys (
   created_at TEXT DEFAULT (datetime('now'))
 )`;
 
-/** Create both tables if they do not exist yet. Safe to call on every access. */
+// Publish jobs: one row per Metricool publish/schedule attempt (v1.3.0).
+// status: draft (saved in Metricool, not scheduled) | scheduled (accepted by
+// Metricool, goes live at scheduled_at) | published (live — set by a later
+// status refresh) | failed. network holds a comma-joined list when several
+// networks were requested in one call.
+const CREATE_PUBLISH_JOBS_SQL = `CREATE TABLE IF NOT EXISTS publish_jobs (
+  id TEXT PRIMARY KEY,
+  task_id TEXT,
+  video_url TEXT NOT NULL,
+  network TEXT NOT NULL,
+  caption TEXT DEFAULT '',
+  scheduled_at TEXT,
+  metricool_post_id TEXT,
+  status TEXT NOT NULL,
+  error_message TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now'))
+)`;
+
+/** Create all tables if they do not exist yet. Safe to call on every access. */
 export async function ensureSchema(): Promise<void> {
   const db = getClient();
   await db.execute(CREATE_TASKS_SQL);
   await db.execute(CREATE_KEYS_SQL);
+  await db.execute(CREATE_PUBLISH_JOBS_SQL);
 }
 
 /** Cheap liveness probe for /api/health. */
@@ -270,4 +306,83 @@ export async function taskStats(): Promise<{
     failed: Number(row.failed ?? 0),
     processing: Number(row.processing ?? 0),
   };
+}
+
+// ---- Publish jobs (Metricool) ----
+
+export async function insertPublishJob(job: {
+  id: string;
+  taskId?: string | null;
+  videoUrl: string;
+  network: string;
+  caption?: string;
+  scheduledAt?: string | null;
+  metricoolPostId?: string | null;
+  status: PublishStatus;
+  errorMessage?: string | null;
+}): Promise<PublishJobRow> {
+  await ensureSchema();
+  const db = getClient();
+  await db.execute({
+    sql: `INSERT INTO publish_jobs (id, task_id, video_url, network, caption, scheduled_at, metricool_post_id, status, error_message)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    args: [
+      job.id,
+      job.taskId ?? null,
+      job.videoUrl,
+      job.network,
+      job.caption ?? "",
+      job.scheduledAt ?? null,
+      job.metricoolPostId ?? null,
+      job.status,
+      job.errorMessage ?? null,
+    ],
+  });
+  const created = await getPublishJob(job.id);
+  if (!created) throw new Error(`Failed to read back publish job ${job.id} after insert.`);
+  return created;
+}
+
+export async function getPublishJob(id: string): Promise<PublishJobRow | null> {
+  const db = getClient();
+  const res = await db.execute({
+    sql: "SELECT * FROM publish_jobs WHERE id = ? LIMIT 1",
+    args: [id],
+  });
+  if (res.rows.length === 0) return null;
+  return res.rows[0] as unknown as PublishJobRow;
+}
+
+export async function updatePublishJob(
+  id: string,
+  patch: { status?: PublishStatus; metricoolPostId?: string | null; errorMessage?: string | null }
+): Promise<PublishJobRow | null> {
+  const db = getClient();
+  const sets: string[] = ["updated_at = datetime('now')"];
+  const args: (string | number | null)[] = [];
+  if (patch.status !== undefined) {
+    sets.push("status = ?");
+    args.push(patch.status);
+  }
+  if (patch.metricoolPostId !== undefined) {
+    sets.push("metricool_post_id = ?");
+    args.push(patch.metricoolPostId);
+  }
+  if (patch.errorMessage !== undefined) {
+    sets.push("error_message = ?");
+    args.push(patch.errorMessage);
+  }
+  args.push(id);
+  await db.execute({ sql: `UPDATE publish_jobs SET ${sets.join(", ")} WHERE id = ?`, args });
+  return getPublishJob(id);
+}
+
+export async function listRecentPublishJobs(limit = 20): Promise<PublishJobRow[]> {
+  await ensureSchema();
+  const db = getClient();
+  const res = await db.execute({
+    sql: "SELECT * FROM publish_jobs ORDER BY created_at DESC, id DESC LIMIT ?",
+    args: [limit],
+  });
+  return res.rows as unknown as PublishJobRow[];
 }

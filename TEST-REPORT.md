@@ -104,3 +104,52 @@ Setup: bogus kie key inserted first, real kie key re-inserted second (insertion 
 ## 12. Cleanup
 
 After testing: the bogus failover-test key was deleted via the API, and all 4 test tasks were deleted from Turso. Final state: **0 tasks, 1 key (kie, active)**. The generated media URLs above remain valid on the provider CDN. No test artifacts remain in the repo (`.env.local` is git-ignored and was never committed).
+
+---
+
+## 13. v1.3.0 — Metricool auto-publishing + story videos (2026-11-09)
+
+### 13.1 Metricool API — sources actually read
+
+- Help guide: https://help.metricool.com/basic-guide-for-api-integration-r97af
+- Official Swagger: https://app.metricool.com/api/swagger.json (read in full for the scheduler + media shapes)
+- Common questions/errors: https://help.metricool.com/common-questions-and-errors-when-using-the-api-8x9nq
+
+Verified facts: base URL `https://app.metricool.com/api`; auth = `X-Mc-Auth` header (API token) + `userId` + `blogId` query params on every call; `POST /v2/scheduler/posts` with body `ScheduledPost` (required: `providers`, `publicationDate` `{dateTime, timezone}`, `text`; optional `media` string array, `saveExternalMediaFiles`, `autoPublish`, `draft`, `firstCommentText`, `facebookData`, `instagramData`, …); publication date must be in the future; **REST API only on Advanced and Custom plans — Free/Starter have no API access** (official help center). Token lives in Metricool under **Account Settings > API**; `userId`/`blogId` are read from the brand URL (`https://app.metricool.com/evolution/web?blogId=…&userId=…`) or via `GET /admin/simpleProfiles?userId=…`.
+
+**Video-media caveat (unverified):** the official Swagger exposes a media-normalize endpoint for **images only** (`GET /actions/normalize/image/url`) — there is NO video normalize endpoint. The client therefore passes the public video URL directly in `media` with `saveExternalMediaFiles: true`. Implemented per the official schemas, but NOT verified against a live Metricool account yet — check the first real post in the Metricool dashboard.
+
+### 13.2 What was built
+
+- `src/lib/metricool.ts` — Metricool API v2 client: env config (`METRICOOL_API_TOKEN`, `METRICOOL_USER_ID`, `METRICOOL_BRAND_ID`, `METRICOOL_TIMEZONE` default `Africa/Cairo`), `createScheduledPost` (future date required; "publish now" = now + 5 min, autoPublish), `normalizeImageUrl`, `listBrands`, and `publishVideoJob` (records every attempt in Turso). No real values anywhere in code.
+- `src/lib/story-ideas.ts` — 12-idea bank for the Fayyaz page (English only, no-face, realistic, 2–3 actions per 10s, comedy from behavior, meaningful twist) + `pickStoryIdea` (deterministic daily rotation) + `buildCaption` (caption + English-only hashtags).
+- `src/lib/turso.ts` — new `publish_jobs` table (`id, task_id, video_url, network, caption, scheduled_at, metricool_post_id, status draft|scheduled|published|failed, error_message, created_at, updated_at`) + `insertPublishJob/getPublishJob/updatePublishJob/listRecentPublishJobs`. Existing tables untouched.
+- MCP tools (now **7**): `publish_video` (video_url or completed task_id + English caption, facebook default, immediate or scheduled, draft option) and `create_story_video` (auto/custom idea → video via `grok-imagine-video-1-5-preview` → caption + hashtags; publishes ONLY when `publish=true` is passed explicitly). `SERVER_INSTRUCTIONS` updated with the publish flow; version bumped to **1.3.0**.
+- `GET /api/health` now includes `metricool: {configured, requiresAdvancedPlan}` (presence only, no values). New `GET /api/publish` route. Dashboard: new **Publishing** section (job list + statuses), Metricool status chip, both new tools listed. All English, LTR.
+- `.env.example` + README updated (Metricool setup steps, plan requirement, video-media caveat).
+
+### 13.3 Tests — all real, local production server
+
+| Check | Result |
+|---|---|
+| `npx tsc --noEmit` | Clean, 0 errors |
+| `npx eslint src/lib src/app` | Clean, 0 errors, 0 warnings |
+| `npm run build` | Succeeds; new route `ƒ /api/publish` |
+| `GET /api/health` | `{"ok":true,"database":"turso-connected",...,"metricool":{"configured":false,"requiresAdvancedPlan":true}}` — honest: no Metricool env vars set |
+| `GET /api/publish` | `{"jobs":[]}` before tests |
+| MCP `tools/list` | **7 tools**, incl. `publish_video` and `create_story_video` with the specified schemas |
+| `publish_video` (public video URL, no config) | `❌ Video publishing is not configured: set METRICOOL_API_TOKEN, METRICOOL_USER_ID and METRICOOL_BRAND_ID …` (`isError: true`) — no success claimed; failed job recorded in Turso and visible in `/api/publish` |
+| `publish_video` with completed `task_id` (no config) | Same not-configured error — proves task_id resolution works (it got past the task lookup to the config check) |
+| `create_story_video` e2e (custom idea, kie.ai, publish=false) | **PASS** — video generated in ~46 s, `get_task` poll 1 already completed; URL verified HEAD `HTTP 200, video/mp4`; reply included the story title, caption + English hashtags, and "Not published (publish=false) — call publish_video with the task_id when you want it live." |
+| Dashboard `GET /` | Renders the Publishing section and both new tool chips (health chips are client-fetched, so they show "Checking…" in raw SSR HTML — expected) |
+
+### 13.4 Not yet tested live (needs user input)
+
+- **Real Metricool publish**: no API token / userId / brandId yet. The user's Metricool account **already has the Fayyaz Pathan Facebook Page connected and Active** (screenshot 2026-11-09: Social Accounts 1/30, Active 1, Expired 0; Page status "Expires in 59 day(s)" — the Facebook connection itself needs re-authorization in ~59 days, around 2027-01-07). Still missing: the API token + userId + brandId (see §13.1 for exactly where to find them). The video-attach path (`media` + `saveExternalMediaFiles`) is the one unverified piece — verify the video attached on the first real post.
+- **Bank idea pick (no custom idea)**: not live-tested as a generation (same code path as the tested custom-idea call, only `pickStoryIdea()` differs; deterministic daily rotation by date).
+- **CometAPI path / exhausted (402) key / real merge**: still pending as in §11.
+- **Vercel deployment**: not deployed; local production server verified instead.
+
+### 13.5 Cleanup (v1.3.0 tests)
+
+Deleted the 1 test video task and the 2 test publish jobs from Turso. Final state: **0 tasks, 0 publish jobs, 1 key (kie, active)**. The generated test video URL remains valid on the provider CDN. No test artifacts in the repo (`.env.local` git-ignored, never committed).

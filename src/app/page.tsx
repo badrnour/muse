@@ -33,12 +33,26 @@ interface TaskPublic {
   created_at: string;
 }
 
+interface PublishJobPublic {
+  id: string;
+  task_id: string | null;
+  video_url: string;
+  network: string;
+  caption: string;
+  scheduled_at: string | null;
+  metricool_post_id: string | null;
+  status: "draft" | "scheduled" | "published" | "failed";
+  error_message: string | null;
+  created_at: string;
+}
+
 interface Health {
   ok: boolean;
   database: string;
   mcpEndpoint: string;
   models: { canonical: string; type: string; providers: string[] }[];
   merger: { base: string | null; healthy: boolean };
+  metricool: { configured: boolean; requiresAdvancedPlan: boolean };
   authRequired: boolean;
 }
 
@@ -48,6 +62,8 @@ const TOOLS = [
   { name: "merge_videos", desc: "Merge several clips into one final video, in order." },
   { name: "get_task", desc: "Track any task by its id until it completes." },
   { name: "list_media", desc: "Recall previously generated media from the database." },
+  { name: "publish_video", desc: "Publish/schedule a finished video via Metricool." },
+  { name: "create_story_video", desc: "Pick a story idea, generate the reel, write its caption." },
 ];
 
 const STATUS_STYLES: Record<string, string> = {
@@ -58,6 +74,9 @@ const STATUS_STYLES: Record<string, string> = {
   failed: "bg-red-100 text-red-800",
   processing: "bg-sky-100 text-sky-800",
   pending: "bg-slate-100 text-slate-700",
+  scheduled: "bg-sky-100 text-sky-800",
+  published: "bg-emerald-100 text-emerald-800",
+  draft: "bg-slate-100 text-slate-700",
 };
 
 function CopyButton({ text, label }: { text: string; label: string }) {
@@ -80,6 +99,7 @@ export default function Dashboard() {
   const [health, setHealth] = useState<Health | null>(null);
   const [keys, setKeys] = useState<ApiKeyPublic[]>([]);
   const [tasks, setTasks] = useState<TaskPublic[]>([]);
+  const [publishJobs, setPublishJobs] = useState<PublishJobPublic[]>([]);
   const [stats, setStats] = useState({ total: 0, completed: 0, failed: 0, processing: 0 });
   const [provider, setProvider] = useState<"kie" | "cometapi">("kie");
   const [label, setLabel] = useState("");
@@ -95,15 +115,17 @@ export default function Dashboard() {
 
   const loadAll = useCallback(async () => {
     try {
-      const [h, k, t] = await Promise.all([
+      const [h, k, t, p] = await Promise.all([
         fetch("/api/health").then((r) => r.json() as Promise<Health>),
         fetch("/api/keys").then((r) => r.json()),
         fetch("/api/tasks?limit=20").then((r) => r.json()),
+        fetch("/api/publish?limit=20").then((r) => r.json()),
       ]);
       setHealth(h);
       if (Array.isArray(k.keys)) setKeys(k.keys);
       if (Array.isArray(t.tasks)) setTasks(t.tasks);
       if (t.stats) setStats(t.stats);
+      if (Array.isArray(p.jobs)) setPublishJobs(p.jobs);
     } catch {
       // Transient fetch failure — the next poll retries.
     }
@@ -193,6 +215,19 @@ export default function Dashboard() {
             }`}
           >
             {health ? (health.merger.healthy ? "● Merger ready" : "● Merger not configured") : "Checking…"}
+          </span>
+          <span
+            className={`rounded-full px-3 py-1 text-xs font-semibold ${
+              health?.metricool.configured
+                ? "bg-emerald-100 text-emerald-800"
+                : "bg-amber-100 text-amber-800"
+            }`}
+          >
+            {health
+              ? health.metricool.configured
+                ? "● Metricool configured"
+                : "● Metricool not configured"
+              : "Checking…"}
           </span>
         </div>
       </header>
@@ -359,6 +394,67 @@ export default function Dashboard() {
         <p className="mt-3 text-xs text-slate-400">Auto-refreshes every ~5 seconds.</p>
       </section>
 
+      {/* (B2) Publishing (Metricool) */}
+      <section className="mb-8 rounded-xl border bg-white p-6 shadow-sm">
+        <h2 className="text-xl font-semibold">Publishing</h2>
+        <p className="mt-1 text-sm text-slate-600">
+          Videos are published/scheduled through the Metricool API (Facebook by default).
+          Metricool is configured with environment variables only —{" "}
+          <code className="rounded bg-slate-100 px-1">METRICOOL_API_TOKEN</code>,{" "}
+          <code className="rounded bg-slate-100 px-1">METRICOOL_USER_ID</code> and{" "}
+          <code className="rounded bg-slate-100 px-1">METRICOOL_BRAND_ID</code> — never from
+          this dashboard, and the token is never shown here. The Metricool REST API needs an
+          Advanced or Custom plan (Free/Starter have no API access). Connect the Fayyaz
+          Facebook Page inside Metricool first, then publish from your MCP client with{" "}
+          <code className="rounded bg-slate-100 px-1">publish_video</code> or{" "}
+          <code className="rounded bg-slate-100 px-1">create_story_video</code> (publish=true).
+        </p>
+        <div className="mt-5 space-y-3">
+          {publishJobs.length === 0 && (
+            <p className="text-sm text-slate-500">
+              No publish jobs yet. Nothing has been published from this server.
+            </p>
+          )}
+          {publishJobs.map((j) => (
+            <div key={j.id} className="rounded-lg border px-4 py-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className={`rounded-full px-2 py-0.5 text-xs font-semibold ${STATUS_STYLES[j.status]}`}>
+                  {j.status}
+                </span>
+                <span className="rounded bg-slate-100 px-2 py-0.5 text-xs font-semibold uppercase">
+                  {j.network}
+                </span>
+                {j.metricool_post_id && (
+                  <span className="font-mono text-xs text-slate-500">post {j.metricool_post_id}</span>
+                )}
+                <span className="ml-auto text-xs text-slate-400">
+                  {new Date(j.created_at + "Z").toLocaleString()}
+                </span>
+              </div>
+              <p className="mt-1 truncate text-sm text-slate-700">{j.caption}</p>
+              <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+                {j.scheduled_at && (
+                  <span className="text-slate-500">
+                    Scheduled: {new Date(j.scheduled_at).toLocaleString()}
+                  </span>
+                )}
+                <a
+                  href={j.video_url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="rounded-md bg-emerald-600 px-2 py-1 font-medium text-white hover:bg-emerald-500"
+                >
+                  Open video ↗
+                </a>
+                {j.status === "failed" && j.error_message && (
+                  <span className="text-red-600">{j.error_message}</span>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      </section>
+
       {/* (C) Connect your server */}
       <section className="rounded-xl border bg-white p-6 shadow-sm">
         <h2 className="text-xl font-semibold">Connect your server</h2>
@@ -418,7 +514,7 @@ export default function Dashboard() {
       </section>
 
       <footer className="mt-8 text-center text-xs text-slate-400">
-        MCP Media Generator v1.2.0 · MCP endpoint: <code>/mcp</code> · Health: <code>/api/health</code>
+        MCP Media Generator v1.3.0 · MCP endpoint: <code>/mcp</code> · Health: <code>/api/health</code>
       </footer>
     </main>
   );
